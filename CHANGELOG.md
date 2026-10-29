@@ -79,6 +79,10 @@ the worked examples and which gate now catches which bug, and
 [`conformance/README.md`](conformance/README.md) for the provenance-discipline
 and weak-coverage-kind policies.
 
+### Changed
+
+- **TypeScript `WalletProvider` broadcasts to BSV Broadcaster by default, on mainnet and testnet.** With no `arcUrl` and no injected `broadcaster`, EF is posted to the BSV Association's BSV Broadcaster (`POST /tx`): `https://arcade-us-1.bsvblockchain.tech` on mainnet, `https://arcade-v2-testnet-us-1.bsvblockchain.tech` on testnet. A testnet provider no longer throws for want of an `arcUrl` (R-179's invariant — the default endpoint matches `network` — still holds). Passing `arcUrl` keeps the previous ARC behaviour (`POST ${arcUrl}/v1/tx`); mainnet callers who relied on the GorillaPool ARC default can pass `arcUrl: 'https://arc.gorillapool.io'`. The protected `arcUrl` field is now `string | undefined`, and a new protected `broadcastUrl` holds the submit URL. The Go, Python, Rust, Zig, Ruby and Java wallet providers are unchanged.
+
 ## [1.0.0-rc.1] — 2026-06-22
 
 First release candidate for 1.0.0. All seven compiler and SDK tiers are unified
