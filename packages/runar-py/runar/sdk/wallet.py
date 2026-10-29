@@ -104,13 +104,24 @@ class WalletClient(ABC):
 # ---------------------------------------------------------------------------
 
 MAINNET_ARC_URL = 'https://arc.gorillapool.io'
-"""The default ARC broadcaster. A MAINNET endpoint — see R-179."""
+"""GorillaPool's MAINNET ARC endpoint. No longer the default; pass it as
+``arc_url`` to keep broadcasting there."""
+
+BSV_BROADCASTER_URLS = {
+    'mainnet': 'https://arcade-us-1.bsvblockchain.tech',
+    'testnet': 'https://arcade-v2-testnet-us-1.bsvblockchain.tech',
+}
+"""The default broadcasters: the BSV Association's public BSV Broadcaster
+endpoints (called Arcade before 0.19.0, hence the hostnames). One per network,
+so the default always matches ``network`` — see R-179. BSV Broadcaster submits
+at ``POST /tx``, not ARC's ``POST /v1/tx``."""
 
 
 class WalletProvider(Provider):
     """Provider implementation backed by a BRC-100 wallet.
 
-    Uses the wallet for UTXO management, GorillaPool ARC for broadcast,
+    Uses the wallet for UTXO management, BSV Broadcaster (or ARC, when
+    ``arc_url`` is given) for broadcast,
     and an optional overlay service for transaction lookups.
     """
 
@@ -131,18 +142,18 @@ class WalletProvider(Provider):
         self.funding_tag = funding_tag
         # R-179: arc_url and network used to be defaulted independently, so a
         # provider configured for testnet reported get_network() == 'testnet'
-        # and broadcast every transaction to the MAINNET ARC. There is no
-        # canonical testnet ARC endpoint to default to, so a non-mainnet
-        # provider has to name its own instead of inheriting one that points at
-        # real money.
+        # and broadcast every transaction to the MAINNET ARC. The default is
+        # now derived from the network; an explicit arc_url is the caller's
+        # choice and is used as given. A network with no default is refused.
+        self.arc_url = arc_url
         if arc_url is not None:
-            self.arc_url = arc_url
-        elif network == 'mainnet':
-            self.arc_url = MAINNET_ARC_URL
+            self.broadcast_url = f'{arc_url}/v1/tx'
+        elif network in BSV_BROADCASTER_URLS:
+            self.broadcast_url = f'{BSV_BROADCASTER_URLS[network]}/tx'
         else:
             raise ValueError(
-                f"WalletProvider: no default ARC endpoint for network {network!r} — "
-                f"{MAINNET_ARC_URL} is a MAINNET broadcaster. Pass arc_url explicitly."
+                f"WalletProvider: no default broadcaster for network {network!r}. "
+                f"Pass arc_url explicitly."
             )
         self.overlay_url = overlay_url
         self._network = network
@@ -231,7 +242,8 @@ class WalletProvider(Provider):
         return TransactionData(txid=txid, version=1)
 
     def broadcast(self, tx) -> str:
-        """Broadcast a transaction via ARC.
+        """Broadcast a transaction via BSV Broadcaster, or via ARC when
+        ``arc_url`` is set.
 
         Accepts either a raw hex string or an object with a .hex() method.
         """
@@ -241,9 +253,8 @@ class WalletProvider(Provider):
             raw_hex = tx.hex()
 
         raw_bytes = bytes.fromhex(raw_hex)
-        url = f'{self.arc_url}/v1/tx'
         req = Request(
-            url,
+            self.broadcast_url,
             data=raw_bytes,
             method='POST',
             headers={'Content-Type': 'application/octet-stream'},
@@ -257,8 +268,9 @@ class WalletProvider(Provider):
             return txid
         except HTTPError as e:
             body = e.read().decode('utf-8', errors='replace')
+            service = 'ARC' if self.arc_url is not None else 'BSV Broadcaster'
             raise RuntimeError(
-                f'WalletProvider: ARC broadcast failed ({e.code}): {body}'
+                f'WalletProvider: {service} broadcast failed ({e.code}): {body}'
             ) from e
 
     def get_contract_utxo(self, script_hash: str) -> Utxo | None:
