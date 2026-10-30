@@ -300,6 +300,32 @@ func (s *stackMap) peekAtDepth(depthFromTop int) string {
 	return s.slots[index]
 }
 
+// relabelNamed renames the named slots, bottom to top, to order. The two must
+// hold the same names the same number of times: this changes which slot a name
+// models, never what is on the stack.
+func (s *stackMap) relabelNamed(order []string, bindingName string) {
+	var named []string
+	for _, n := range s.slots {
+		if n != "" {
+			named = append(named, n)
+		}
+	}
+	a := append([]string(nil), named...)
+	b := append([]string(nil), order...)
+	sort.Strings(a)
+	sort.Strings(b)
+	if strings.Join(a, "\x00") != strings.Join(b, "\x00") || len(a) != len(b) {
+		panic(fmt.Sprintf("internal codegen error: the conditional's arms agree on slots %v but the parent models %v; binding=%q", order, named, bindingName))
+	}
+	k := 0
+	for i, n := range s.slots {
+		if n != "" {
+			s.slots[i] = order[k]
+			k++
+		}
+	}
+}
+
 func (s *stackMap) renameAtDepth(depthFromTop int, newName string) {
 	idx := len(s.slots) - 1 - depthFromTop
 	if idx < 0 || idx >= len(s.slots) {
@@ -1266,6 +1292,135 @@ func (ctx *loweringContext) drainBranchPrivateResidue(preIfNames map[string]bool
 			ctx.sm.push(rolled)
 			ctx.emitOp(StackOp{Op: "drop"})
 			ctx.sm.pop()
+		}
+	}
+}
+
+// inheritedSlots returns the slots this arm inherited from the parent, as arm
+// stack indices (bottom = 0) in the arm's current order. A slot is matched to
+// the parent by name and multiplicity: for each name, the deepest
+// min(parent count, arm count) occurrences. Everything else the arm holds (its
+// results, a rebound local's new value) is not inherited.
+func (ctx *loweringContext) inheritedSlots(parent *stackMap) []int {
+	parentCounts := countNamedSlots(parent)
+	seen := make(map[string]int)
+	var inherited []int
+	for i, n := range ctx.sm.slots {
+		if n == "" {
+			continue
+		}
+		k := seen[n]
+		seen[n] = k + 1
+		if k < parentCounts[n] {
+			inherited = append(inherited, i)
+		}
+	}
+	return inherited
+}
+
+// inheritedOrder returns the names of this arm's inherited slots, bottom first.
+func (ctx *loweringContext) inheritedOrder(parent *stackMap) []string {
+	inherited := ctx.inheritedSlots(parent)
+	order := make([]string, len(inherited))
+	for j, i := range inherited {
+		order[j] = ctx.sm.slots[i]
+	}
+	return order
+}
+
+// alignmentRolls returns the arm slots to roll to the top, in turn, so that
+// the inherited slots stand in `order` (names, bottom first) with everything
+// else above them in its current order. The longest run at the bottom already
+// in place stays. Same-named slots keep their relative order, so a name held
+// twice keeps its dead-below-live layout.
+func (ctx *loweringContext) alignmentRolls(parent *stackMap, order []string) []int {
+	inherited := ctx.inheritedSlots(parent)
+	byName := make(map[string][]int)
+	inSet := make(map[int]bool, len(inherited))
+	for _, i := range inherited {
+		n := ctx.sm.slots[i]
+		byName[n] = append(byName[n], i)
+		inSet[i] = true
+	}
+	target := make([]int, 0, ctx.sm.depth())
+	taken := make(map[string]int)
+	for _, n := range order {
+		k := taken[n]
+		taken[n] = k + 1
+		target = append(target, byName[n][k])
+	}
+	for i := 0; i < ctx.sm.depth(); i++ {
+		if !inSet[i] {
+			target = append(target, i)
+		}
+	}
+	// Slots never rolled keep their relative order and sink to the bottom, so
+	// the longest increasing prefix of target stays and the rest is rolled.
+	keep := 0
+	for keep < len(target) && (keep == 0 || target[keep] > target[keep-1]) {
+		keep++
+	}
+	return target[keep:]
+}
+
+// rollSequence replays rolls (arm indices, in turn) and returns the depth each
+// one rolls from.
+func rollSequence(depth int, rolls []int) []int {
+	current := make([]int, depth)
+	for i := range current {
+		current[i] = i
+	}
+	depths := make([]int, 0, len(rolls))
+	for _, index := range rolls {
+		pos := 0
+		for current[pos] != index {
+			pos++
+		}
+		depths = append(depths, len(current)-1-pos)
+		current = append(current[:pos], current[pos+1:]...)
+		current = append(current, index)
+	}
+	return depths
+}
+
+// alignmentCost returns the bytes alignInheritedLayout would emit: SWAP and ROT
+// are one byte, a deeper ROLL is its depth push plus OP_ROLL.
+func (ctx *loweringContext) alignmentCost(parent *stackMap, order []string) int {
+	bytes := 0
+	for _, depth := range rollSequence(ctx.sm.depth(), ctx.alignmentRolls(parent, order)) {
+		switch {
+		case depth == 0:
+		case depth <= 2:
+			bytes++
+		case depth <= 16:
+			bytes += 2
+		case depth <= 127:
+			bytes += 3
+		default:
+			bytes += 4
+		}
+	}
+	return bytes
+}
+
+// alignInheritedLayout puts this arm's inherited slots in `order` (issue
+// #178): see alignmentRolls. Emits nothing when they already are.
+func (ctx *loweringContext) alignInheritedLayout(parent *stackMap, order []string) {
+	for _, depth := range rollSequence(ctx.sm.depth(), ctx.alignmentRolls(parent, order)) {
+		switch {
+		case depth == 0:
+		case depth == 1:
+			ctx.emitOp(StackOp{Op: "swap"})
+			ctx.sm.swap()
+		case depth == 2:
+			ctx.emitOp(StackOp{Op: "rot"})
+			ctx.sm.push(ctx.sm.removeAtDepth(2))
+		default:
+			ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(depth))})
+			ctx.sm.push("")
+			ctx.emitOp(StackOp{Op: "roll", Depth: depth})
+			ctx.sm.pop()
+			ctx.sm.push(ctx.sm.removeAtDepth(depth))
 		}
 	}
 }
@@ -2468,6 +2623,35 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	}
 
+	// Issue #178: both arms now hold the same inherited slots, but not
+	// necessarily in the same ORDER, and the order need not be the parent's.
+	// Rebinding a local that is dead after the `if` consumes its slot and
+	// pushes the new value on top (`w = w - 1n` turns [w k] into [k w]); a
+	// nested `if` without `else` that rebinds a live local leaves the new value
+	// on top of its neighbours. Everything below reads the arms by position, and
+	// used to model the parent's order, so a read of a moved slot on one path
+	// took its neighbour's value.
+	//
+	// Bring the arms into agreement here, in whichever arm costs fewer bytes (an
+	// else arm that would otherwise be empty also pays for its OP_ELSE), and let
+	// the parent adopt that order after OP_ENDIF. Before the result trim, which
+	// removes the slots just beneath the results and so needs every inherited
+	// slot below them.
+	thenOrder := thenCtx.inheritedOrder(ctx.sm)
+	elseOrder := elseCtx.inheritedOrder(ctx.sm)
+	thenAlignCost := thenCtx.alignmentCost(ctx.sm, elseOrder)
+	elseAlignCost := elseCtx.alignmentCost(ctx.sm, thenOrder)
+	if elseAlignCost > 0 && len(elseBindings) == 0 {
+		elseAlignCost++
+	}
+	inheritedOrder := thenOrder
+	if thenAlignCost <= elseAlignCost {
+		inheritedOrder = elseOrder
+		thenCtx.alignInheritedLayout(ctx.sm, elseOrder)
+	} else {
+		elseCtx.alignInheritedLayout(ctx.sm, thenOrder)
+	}
+
 	// Trim each arm down to exactly its declared result slots.
 	//
 	// ANF lowering ends both arms with an identical N-binding block that
@@ -2602,6 +2786,19 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	// The equality below is therefore an invariant, not a test, and is left as
 	// a comment rather than a panic that can never run.
 
+	// Layer D: equal depth is not enough, the arms must agree slot by slot on
+	// every name the parent can read after OP_ENDIF. A slot only one arm names
+	// is skipped: a phase-3 placeholder, or the `if`'s own value, which each arm
+	// binds under its own temporary. Two different parent names at the same
+	// depth mean one path reads its neighbour's value (#178). Emits no opcodes.
+	for d := 0; d < thenCtx.sm.depth(); d++ {
+		tn := thenCtx.sm.peekAtDepth(d)
+		en := elseCtx.sm.peekAtDepth(d)
+		if tn != "" && en != "" && tn != en && preIfNames[tn] && preIfNames[en] {
+			panic(fmt.Sprintf("internal codegen error: conditional arms leave different stack layouts (depth %d holds %q after the then-arm and %q after the else-arm), so every later read of either slot would take the wrong value on one path (see GitHub issue #178); binding=%q", d, tn, en, bindingName))
+		}
+	}
+
 	thenOps := thenCtx.ops
 	elseOps := elseCtx.ops
 
@@ -2634,6 +2831,10 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 			ctx.sm.removeAtDepth(ctx.sm.findDepth(name))
 		}
 	}
+
+	// #178: what is left is exactly the slots both arms inherited, which now
+	// stand in inheritedOrder on either path. Model that order.
+	ctx.sm.relabelNamed(inheritedOrder, bindingName)
 
 	// C27: the N>=2 result reconcile below also applies when the else-branch is
 	// PRESENT and BOTH arms wrote the same N mutable fields (e.g. each branch

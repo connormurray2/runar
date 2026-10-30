@@ -334,6 +334,27 @@ class StackMap {
     return names;
   }
 
+  /**
+   * Rename the named slots, bottom to top, to `order`. The two must hold the
+   * same names the same number of times: this changes which slot a name
+   * models, never what is on the stack.
+   */
+  relabelNamed(order: string[], bindingName: string): void {
+    const named = this.slots.filter((s): s is string => s !== null);
+    const sorted = (xs: string[]) => [...xs].sort().join('\u0000');
+    if (named.length !== order.length || sorted(named) !== sorted(order)) {
+      throw new Error(
+        `Internal codegen error: the conditional's arms agree on slots ` +
+        `[${order.join(', ')}] but the parent models [${named.join(', ')}]. ` +
+        `binding='${bindingName}'.`,
+      );
+    }
+    let k = 0;
+    for (let i = 0; i < this.slots.length; i++) {
+      if (this.slots[i] !== null) this.slots[i] = order[k++]!;
+    }
+  }
+
   /** Rename a slot at a given depth from top. */
   renameAtDepth(depthFromTop: number, newName: string | null): void {
     const index = this.slots.length - 1 - depthFromTop;
@@ -1336,6 +1357,116 @@ class LoweringContext {
         this.stackMap.push(rolled);
         this.emitOp({ op: 'drop' });
         this.stackMap.pop();
+      }
+    }
+  }
+
+  /**
+   * The slots this arm inherited from the parent, as arm stack indices (bottom
+   * = 0) in the arm's current order. A slot is matched to the parent by name
+   * and multiplicity: for each name, the deepest `min(parent count, arm count)`
+   * occurrences. Everything else the arm holds (its results, a rebound
+   * local's new value) is not inherited.
+   */
+  private inheritedSlots(parent: StackMap): number[] {
+    const parentCounts = new Map<string, number>();
+    for (let d = 0; d < parent.depth; d++) {
+      const n = parent.peekAtDepth(d);
+      if (n !== null) parentCounts.set(n, (parentCounts.get(n) ?? 0) + 1);
+    }
+    const seen = new Map<string, number>();
+    const inherited: number[] = [];
+    for (let i = 0; i < this.stackMap.depth; i++) {
+      const n = this.stackMap.peekAtDepth(this.stackMap.depth - 1 - i);
+      if (n === null) continue;
+      const k = seen.get(n) ?? 0;
+      seen.set(n, k + 1);
+      if (k < (parentCounts.get(n) ?? 0)) inherited.push(i);
+    }
+    return inherited;
+  }
+
+  /** The names of this arm's inherited slots, bottom first. */
+  inheritedOrder(parent: StackMap): string[] {
+    return this.inheritedSlots(parent).map(
+      (i) => this.stackMap.peekAtDepth(this.stackMap.depth - 1 - i)!,
+    );
+  }
+
+  /**
+   * The arm slots to roll to the top, in turn, so that the inherited slots
+   * stand in `order` (names, bottom first) with everything else above them in
+   * its current order. The longest run at the bottom already in place stays.
+   * Same-named slots keep their relative order, so a name held twice keeps
+   * its dead-below-live layout.
+   */
+  private alignmentRolls(parent: StackMap, order: string[]): number[] {
+    const inherited = this.inheritedSlots(parent);
+    const byName = new Map<string, number[]>();
+    for (const i of inherited) {
+      const n = this.stackMap.peekAtDepth(this.stackMap.depth - 1 - i)!;
+      byName.set(n, [...(byName.get(n) ?? []), i]);
+    }
+    const target: number[] = [];
+    const taken = new Map<string, number>();
+    for (const n of order) {
+      const k = taken.get(n) ?? 0;
+      taken.set(n, k + 1);
+      target.push(byName.get(n)![k]!);
+    }
+    const inSet = new Set(inherited);
+    for (let i = 0; i < this.stackMap.depth; i++) if (!inSet.has(i)) target.push(i);
+    // Slots never rolled keep their relative order and sink to the bottom, so
+    // the longest increasing prefix of `target` stays and the rest is rolled.
+    let keep = 0;
+    while (keep < target.length && (keep === 0 || target[keep]! > target[keep - 1]!)) keep++;
+    return target.slice(keep);
+  }
+
+  /**
+   * Bytes `alignInheritedLayout` would emit: SWAP and ROT are one byte, a
+   * deeper ROLL is its depth push plus OP_ROLL.
+   */
+  alignmentCost(parent: StackMap, order: string[]): number {
+    const rolls = this.alignmentRolls(parent, order);
+    const current = Array.from({ length: this.stackMap.depth }, (_u, i) => i);
+    let bytes = 0;
+    for (const index of rolls) {
+      const pos = current.indexOf(index);
+      const depth = current.length - 1 - pos;
+      current.splice(pos, 1);
+      current.push(index);
+      if (depth === 0) continue;
+      bytes += depth <= 2 ? 1 : depth <= 16 ? 2 : depth <= 127 ? 3 : 4;
+    }
+    return bytes;
+  }
+
+  /**
+   * Put this arm's inherited slots in `order` (issue #178): see
+   * `alignmentRolls`. Emits nothing when they already are.
+   */
+  alignInheritedLayout(parent: StackMap, order: string[]): void {
+    const rolls = this.alignmentRolls(parent, order);
+    const current = Array.from({ length: this.stackMap.depth }, (_u, i) => i);
+    for (const index of rolls) {
+      const pos = current.indexOf(index);
+      const depth = current.length - 1 - pos;
+      current.splice(pos, 1);
+      current.push(index);
+      if (depth === 0) continue;
+      if (depth === 1) {
+        this.emitOp({ op: 'swap' });
+        this.stackMap.swap();
+      } else if (depth === 2) {
+        this.emitOp({ op: 'rot' });
+        this.stackMap.push(this.stackMap.removeAtDepth(2));
+      } else {
+        this.emitOp({ op: 'push', value: BigInt(depth) });
+        this.stackMap.push(null);
+        this.emitOp({ op: 'roll', depth });
+        this.stackMap.pop();
+        this.stackMap.push(this.stackMap.removeAtDepth(depth));
       }
     }
   }
@@ -2717,6 +2848,32 @@ class LoweringContext {
       }
     }
 
+    // Issue #178: both arms now hold the same inherited slots, but not
+    // necessarily in the same ORDER, and the order need not be the parent's.
+    // Rebinding a local that is dead after the `if` consumes its slot and
+    // pushes the new value on top (`w = w - 1n` turns `[w k]` into `[k w]`); a
+    // nested `if` without `else` that rebinds a live local leaves the new value
+    // on top of its neighbours. Everything below reads the arms by position,
+    // and used to model the parent's order, so a read of a moved slot on one
+    // path took its neighbour's value.
+    //
+    // Bring the arms into agreement here, in whichever arm costs fewer bytes
+    // (an else arm that would otherwise be empty also pays for its OP_ELSE),
+    // and let the parent adopt that order after OP_ENDIF. Before the result
+    // trim, which removes the slots just beneath the results and so needs every
+    // inherited slot below them.
+    const thenOrder = thenCtx.inheritedOrder(this.stackMap);
+    const elseOrder = elseCtx.inheritedOrder(this.stackMap);
+    const thenAlignCost = thenCtx.alignmentCost(this.stackMap, elseOrder);
+    let elseAlignCost = elseCtx.alignmentCost(this.stackMap, thenOrder);
+    if (elseAlignCost > 0 && elseBindings.length === 0) elseAlignCost += 1;
+    const inheritedOrder = thenAlignCost <= elseAlignCost ? elseOrder : thenOrder;
+    if (thenAlignCost <= elseAlignCost) {
+      thenCtx.alignInheritedLayout(this.stackMap, elseOrder);
+    } else {
+      elseCtx.alignInheritedLayout(this.stackMap, thenOrder);
+    }
+
     // Branch-merged locals: trim each arm down to exactly its K result slots.
     //
     // 04-anf-lower ends both arms with an identical K-binding block that
@@ -2841,6 +2998,24 @@ class LoweringContext {
       );
     }
 
+    // Layer D: equal depth is not enough, the arms must agree slot by slot on
+    // every name the parent can read after OP_ENDIF. A slot only one arm names
+    // is skipped: a phase-3 placeholder, or the `if`'s own value, which each
+    // arm binds under its own temporary. Two different parent names at the same
+    // depth mean one path reads its neighbour's value (#178). Emits no opcodes.
+    for (let d = 0; d < thenCtx.stackMap.depth; d++) {
+      const tn = thenCtx.stackMap.peekAtDepth(d);
+      const en = elseCtx.stackMap.peekAtDepth(d);
+      if (tn !== null && en !== null && tn !== en && preIfNames.has(tn) && preIfNames.has(en)) {
+        throw new Error(
+          `Internal codegen error: conditional arms leave different stack layouts ` +
+          `(depth ${d} holds '${tn}' after the then-arm and '${en}' after the ` +
+          `else-arm), so every later read of either slot would take the wrong ` +
+          `value on one path (see GitHub issue #178). binding='${bindingName}'.`,
+        );
+      }
+    }
+
     const thenOps = thenCtx.result.ops;
     const elseOps = elseCtx.result.ops;
 
@@ -2875,6 +3050,10 @@ class LoweringContext {
         excess--;
       }
     }
+
+    // #178: what is left is exactly the slots both arms inherited, which now
+    // stand in `inheritedOrder` on either path. Model that order.
+    this.stackMap.relabelNamed(inheritedOrder, bindingName);
 
     // C27: the N>=2 result reconcile below also applies when the else-branch is
     // PRESENT and BOTH arms wrote the same N names (e.g. each branch runs

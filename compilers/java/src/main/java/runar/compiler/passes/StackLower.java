@@ -336,6 +336,30 @@ public final class StackLower {
             slots.add(slots.get(slots.size() - 1));
         }
 
+        /**
+         * Rename the named slots, bottom to top, to {@code order}. The two must
+         * hold the same names the same number of times: this changes which slot
+         * a name models, never what is on the stack.
+         */
+        void relabelNamed(List<String> order, String bindingName) {
+            List<String> named = new ArrayList<>();
+            for (String n : slots) if (n != null && !n.isEmpty()) named.add(n);
+            List<String> a = new ArrayList<>(named);
+            List<String> b = new ArrayList<>(order);
+            java.util.Collections.sort(a);
+            java.util.Collections.sort(b);
+            if (!a.equals(b)) {
+                throw new RuntimeException(
+                    "Internal codegen error: the conditional's arms agree on slots " + order
+                    + " but the parent models " + named + ". binding='" + bindingName + "'.");
+            }
+            int k = 0;
+            for (int i = 0; i < slots.size(); i++) {
+                String n = slots.get(i);
+                if (n != null && !n.isEmpty()) slots.set(i, order.get(k++));
+            }
+        }
+
         void renameAtDepth(int depthFromTop, String newName) {
             int idx = slots.size() - 1 - depthFromTop;
             if (idx < 0 || idx >= slots.size()) {
@@ -1414,6 +1438,120 @@ public final class StackLower {
                     sm.pop();
                 }
             }
+        }
+
+        /**
+         * The slots this arm inherited from the parent, as arm stack indices
+         * (bottom = 0) in the arm's current order. A slot is matched to the
+         * parent by name and multiplicity: for each name, the deepest
+         * {@code min(parent count, arm count)} occurrences. Everything else the
+         * arm holds (its results, a rebound local's new value) is not inherited.
+         */
+        List<Integer> inheritedSlots(StackMap parent) {
+            Map<String, Integer> parentCounts = parent.nameCounts();
+            Map<String, Integer> seen = new HashMap<>();
+            List<Integer> inherited = new ArrayList<>();
+            for (int i = 0; i < sm.slots.size(); i++) {
+                String n = sm.slots.get(i);
+                if (n == null || n.isEmpty()) continue;
+                int k = seen.getOrDefault(n, 0);
+                seen.put(n, k + 1);
+                if (k < parentCounts.getOrDefault(n, 0)) inherited.add(i);
+            }
+            return inherited;
+        }
+
+        /** The names of this arm's inherited slots, bottom first. */
+        List<String> inheritedOrder(StackMap parent) {
+            List<String> order = new ArrayList<>();
+            for (int i : inheritedSlots(parent)) order.add(sm.slots.get(i));
+            return order;
+        }
+
+        /**
+         * The arm slots to roll to the top, in turn, so that the inherited
+         * slots stand in {@code order} (names, bottom first) with everything
+         * else above them in its current order. The longest run at the bottom
+         * already in place stays. Same-named slots keep their relative order,
+         * so a name held twice keeps its dead-below-live layout.
+         */
+        List<Integer> alignmentRolls(StackMap parent, List<String> order) {
+            List<Integer> inherited = inheritedSlots(parent);
+            Map<String, List<Integer>> byName = new HashMap<>();
+            for (int i : inherited) {
+                byName.computeIfAbsent(sm.slots.get(i), k -> new ArrayList<>()).add(i);
+            }
+            List<Integer> target = new ArrayList<>();
+            Map<String, Integer> taken = new HashMap<>();
+            for (String n : order) {
+                int k = taken.getOrDefault(n, 0);
+                taken.put(n, k + 1);
+                target.add(byName.get(n).get(k));
+            }
+            Set<Integer> inSet = new HashSet<>(inherited);
+            for (int i = 0; i < sm.slots.size(); i++) {
+                if (!inSet.contains(i)) target.add(i);
+            }
+            // Slots never rolled keep their relative order and sink to the
+            // bottom, so the longest increasing prefix of target stays and the
+            // rest is rolled.
+            int keep = 0;
+            while (keep < target.size() && (keep == 0 || target.get(keep) > target.get(keep - 1))) keep++;
+            return new ArrayList<>(target.subList(keep, target.size()));
+        }
+
+        /**
+         * Bytes {@code alignInheritedLayout} would emit: SWAP and ROT are one
+         * byte, a deeper ROLL is its depth push plus OP_ROLL.
+         */
+        int alignmentCost(StackMap parent, List<String> order) {
+            int bytes = 0;
+            for (int depth : rollSequence(sm.slots.size(), alignmentRolls(parent, order))) {
+                if (depth == 0) continue;
+                bytes += depth <= 2 ? 1 : depth <= 16 ? 2 : depth <= 127 ? 3 : 4;
+            }
+            return bytes;
+        }
+
+        /**
+         * Put this arm's inherited slots in {@code order} (issue #178): see
+         * {@code alignmentRolls}. Emits nothing when they already are.
+         */
+        void alignInheritedLayout(StackMap parent, List<String> order) {
+            List<Integer> rolls = alignmentRolls(parent, order);
+            for (int depth : rollSequence(sm.slots.size(), rolls)) {
+                if (depth == 0) continue;
+                if (depth == 1) {
+                    emitOp(new SwapOp());
+                    sm.swap();
+                } else if (depth == 2) {
+                    emitOp(new RotOp());
+                    sm.push(sm.removeAtDepth(2));
+                } else {
+                    emitOp(new PushOp(PushValue.of(depth)));
+                    sm.push("");
+                    emitOp(new RollOp(depth));
+                    sm.pop();
+                    sm.push(sm.removeAtDepth(depth));
+                }
+            }
+        }
+
+        /**
+         * Replay {@code rolls} (arm indices, in turn) over a stack of
+         * {@code depth} slots and return the depth each one rolls from.
+         */
+        static List<Integer> rollSequence(int depth, List<Integer> rolls) {
+            List<Integer> current = new ArrayList<>();
+            for (int i = 0; i < depth; i++) current.add(i);
+            List<Integer> depths = new ArrayList<>();
+            for (int index : rolls) {
+                int pos = current.indexOf(index);
+                depths.add(current.size() - 1 - pos);
+                current.remove(pos);
+                current.add(index);
+            }
+            return depths;
         }
 
         boolean isLastUse(String ref, int currentIndex, Map<String, Integer> lastUses) {
@@ -3077,6 +3215,35 @@ public final class StackLower {
                 for (int d : thenCtx.sm.dropDepthsFor(elseConsumedNames)) dropAtDepth(thenCtx, d);
             }
 
+            // Issue #178: both arms now hold the same inherited slots, but not
+            // necessarily in the same ORDER, and the order need not be the
+            // parent's. Rebinding a local that is dead after the `if` consumes
+            // its slot and pushes the new value on top (`w = w - 1n` turns
+            // [w k] into [k w]); a nested `if` without `else` that rebinds a
+            // live local leaves the new value on top of its neighbours.
+            // Everything below reads the arms by position, and used to model
+            // the parent's order, so a read of a moved slot on one path took its
+            // neighbour's value.
+            //
+            // Bring the arms into agreement here, in whichever arm costs fewer
+            // bytes (an else arm that would otherwise be empty also pays for its
+            // OP_ELSE), and let the parent adopt that order after OP_ENDIF.
+            // Before the result trim, which removes the slots just beneath the
+            // results and so needs every inherited slot below them.
+            List<String> thenOrder = thenCtx.inheritedOrder(sm);
+            List<String> elseOrder = elseCtx.inheritedOrder(sm);
+            int thenAlignCost = thenCtx.alignmentCost(sm, elseOrder);
+            int elseAlignCost = elseCtx.alignmentCost(sm, thenOrder);
+            if (elseAlignCost > 0 && elseB.isEmpty()) elseAlignCost++;
+            List<String> inheritedOrder;
+            if (thenAlignCost <= elseAlignCost) {
+                thenCtx.alignInheritedLayout(sm, elseOrder);
+                inheritedOrder = elseOrder;
+            } else {
+                elseCtx.alignInheritedLayout(sm, thenOrder);
+                inheritedOrder = thenOrder;
+            }
+
             // Branch-merged locals: trim each arm down to exactly its K
             // result slots.
             //
@@ -3202,6 +3369,26 @@ public final class StackLower {
                     + "(see GitHub issue #99). binding='" + bindingName + "'.");
             }
 
+            // Layer D: equal depth is not enough, the arms must agree slot by
+            // slot on every name the parent can read after OP_ENDIF. A slot only
+            // one arm names is skipped: a phase-3 placeholder, or the `if`'s own
+            // value, which each arm binds under its own temporary. Two different
+            // parent names at the same depth mean one path reads its
+            // neighbour's value (#178). Emits no opcodes.
+            for (int d = 0; d < thenCtx.sm.depth(); d++) {
+                String tn = thenCtx.sm.peekAtDepth(d);
+                String en = elseCtx.sm.peekAtDepth(d);
+                if (tn == null || tn.isEmpty() || en == null || en.isEmpty() || tn.equals(en)) continue;
+                if (preIfNames.contains(tn) && preIfNames.contains(en)) {
+                    throw new RuntimeException(
+                        "Internal codegen error: conditional arms leave different stack layouts "
+                        + "(depth " + d + " holds '" + tn + "' after the then-arm and '" + en
+                        + "' after the else-arm), so every later read of either slot would take "
+                        + "the wrong value on one path (see GitHub issue #178). binding='"
+                        + bindingName + "'.");
+                }
+            }
+
             // NEW-018 needs the arms' post-branch name MULTISET. Snapshotted here
             // because the arms' op lists are consumed immediately after this point.
             Map<String, Integer> postBranchCounts = thenCtx.sm.nameCounts();
@@ -3238,6 +3425,10 @@ public final class StackLower {
                     excess--;
                 }
             }
+
+            // #178: what is left is exactly the slots both arms inherited, which
+            // now stand in inheritedOrder on either path. Model that order.
+            sm.relabelNamed(inheritedOrder, bindingName);
 
             // C27: the N>=2 result reconcile below also applies when the else-
             // branch is PRESENT and BOTH arms wrote the same N mutable fields

@@ -347,6 +347,30 @@ impl StackMap {
         &self.slots[index]
     }
 
+    /// Rename the named slots, bottom to top, to `order`. The two must hold the
+    /// same names the same number of times: this changes which slot a name
+    /// models, never what is on the stack.
+    fn relabel_named(&mut self, order: &[String], binding_name: &str) {
+        let mut named: Vec<String> = self.slots.iter().filter(|n| !n.is_empty()).cloned().collect();
+        let mut sorted_order: Vec<String> = order.to_vec();
+        let shown = named.clone();
+        named.sort();
+        sorted_order.sort();
+        if named != sorted_order {
+            panic!(
+                "internal codegen error: the conditional's arms agree on slots {:?} but the parent models {:?}; binding={:?}",
+                order, shown, binding_name
+            );
+        }
+        let mut k = 0;
+        for slot in self.slots.iter_mut() {
+            if !slot.is_empty() {
+                *slot = order[k].clone();
+                k += 1;
+            }
+        }
+    }
+
     fn rename_at_depth(&mut self, depth_from_top: usize, new_name: &str) {
         let idx = self.slots.len() - 1 - depth_from_top;
         self.slots[idx] = new_name.to_string();
@@ -420,6 +444,20 @@ impl StackMap {
 // ---------------------------------------------------------------------------
 // Use analysis
 // ---------------------------------------------------------------------------
+
+/// Replay `rolls` (arm indices, in turn) over a stack of `depth` slots and
+/// return the depth each one rolls from.
+fn roll_sequence(depth: usize, rolls: &[usize]) -> Vec<usize> {
+    let mut current: Vec<usize> = (0..depth).collect();
+    let mut depths = Vec::with_capacity(rolls.len());
+    for &index in rolls {
+        let pos = current.iter().position(|&c| c == index).unwrap();
+        depths.push(current.len() - 1 - pos);
+        current.remove(pos);
+        current.push(index);
+    }
+    depths
+}
 
 fn compute_last_uses(bindings: &[ANFBinding]) -> HashMap<String, usize> {
     let mut last_use = HashMap::new();
@@ -1345,6 +1383,113 @@ impl LoweringContext {
                 self.sm.push(&rolled);
                 self.emit_op(StackOp::Drop);
                 self.sm.pop();
+            }
+        }
+    }
+
+    /// The slots this arm inherited from the parent, as arm stack indices
+    /// (bottom = 0) in the arm's current order. A slot is matched to the parent
+    /// by name and multiplicity: for each name, the deepest
+    /// `min(parent count, arm count)` occurrences. Everything else the arm
+    /// holds (its results, a rebound local's new value) is not inherited.
+    fn inherited_slots(&self, parent: &StackMap) -> Vec<usize> {
+        let parent_counts = parent.name_counts();
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut inherited = Vec::new();
+        for (i, n) in self.sm.slots.iter().enumerate() {
+            if n.is_empty() {
+                continue;
+            }
+            let k = seen.entry(n.as_str()).or_insert(0);
+            if *k < parent_counts.get(n).copied().unwrap_or(0) {
+                inherited.push(i);
+            }
+            *k += 1;
+        }
+        inherited
+    }
+
+    /// The names of this arm's inherited slots, bottom first.
+    fn inherited_order(&self, parent: &StackMap) -> Vec<String> {
+        self.inherited_slots(parent)
+            .into_iter()
+            .map(|i| self.sm.slots[i].clone())
+            .collect()
+    }
+
+    /// The arm slots to roll to the top, in turn, so that the inherited slots
+    /// stand in `order` (names, bottom first) with everything else above them
+    /// in its current order. The longest run at the bottom already in place
+    /// stays. Same-named slots keep their relative order, so a name held twice
+    /// keeps its dead-below-live layout.
+    fn alignment_rolls(&self, parent: &StackMap, order: &[String]) -> Vec<usize> {
+        let inherited = self.inherited_slots(parent);
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for &i in &inherited {
+            by_name.entry(self.sm.slots[i].as_str()).or_default().push(i);
+        }
+        let in_set: HashSet<usize> = inherited.iter().copied().collect();
+        let mut target: Vec<usize> = Vec::with_capacity(self.sm.depth());
+        let mut taken: HashMap<&str, usize> = HashMap::new();
+        for n in order {
+            let k = taken.entry(n.as_str()).or_insert(0);
+            target.push(by_name[n.as_str()][*k]);
+            *k += 1;
+        }
+        for i in 0..self.sm.depth() {
+            if !in_set.contains(&i) {
+                target.push(i);
+            }
+        }
+        // Slots never rolled keep their relative order and sink to the bottom,
+        // so the longest increasing prefix of `target` stays and the rest is
+        // rolled.
+        let mut keep = 0;
+        while keep < target.len() && (keep == 0 || target[keep] > target[keep - 1]) {
+            keep += 1;
+        }
+        target.split_off(keep)
+    }
+
+    /// Bytes `align_inherited_layout` would emit: SWAP and ROT are one byte, a
+    /// deeper ROLL is its depth push plus OP_ROLL.
+    fn alignment_cost(&self, parent: &StackMap, order: &[String]) -> usize {
+        roll_sequence(self.sm.depth(), &self.alignment_rolls(parent, order))
+            .into_iter()
+            .map(|depth| match depth {
+                0 => 0,
+                1 | 2 => 1,
+                3..=16 => 2,
+                17..=127 => 3,
+                _ => 4,
+            })
+            .sum()
+    }
+
+    /// Put this arm's inherited slots in `order` (issue #178): see
+    /// `alignment_rolls`. Emits nothing when they already are.
+    fn align_inherited_layout(&mut self, parent: &StackMap, order: &[String]) {
+        let rolls = self.alignment_rolls(parent, order);
+        for depth in roll_sequence(self.sm.depth(), &rolls) {
+            match depth {
+                0 => {}
+                1 => {
+                    self.emit_op(StackOp::Swap);
+                    self.sm.swap();
+                }
+                2 => {
+                    self.emit_op(StackOp::Rot);
+                    let rolled = self.sm.remove_at_depth(2);
+                    self.sm.push(&rolled);
+                }
+                _ => {
+                    self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
+                    self.sm.push("");
+                    self.emit_op(StackOp::Roll { depth });
+                    self.sm.pop();
+                    let rolled = self.sm.remove_at_depth(depth);
+                    self.sm.push(&rolled);
+                }
             }
         }
     }
@@ -2569,6 +2714,35 @@ impl LoweringContext {
             }
         }
 
+        // Issue #178: both arms now hold the same inherited slots, but not
+        // necessarily in the same ORDER, and the order need not be the
+        // parent's. Rebinding a local that is dead after the `if` consumes its
+        // slot and pushes the new value on top (`w = w - 1n` turns `[w k]` into
+        // `[k w]`); a nested `if` without `else` that rebinds a live local
+        // leaves the new value on top of its neighbours. Everything below reads
+        // the arms by position, and used to model the parent's order, so a read
+        // of a moved slot on one path took its neighbour's value.
+        //
+        // Bring the arms into agreement here, in whichever arm costs fewer
+        // bytes (an else arm that would otherwise be empty also pays for its
+        // OP_ELSE), and let the parent adopt that order after OP_ENDIF. Before
+        // the result trim, which removes the slots just beneath the results and
+        // so needs every inherited slot below them.
+        let then_order = then_ctx.inherited_order(&self.sm);
+        let else_order = else_ctx.inherited_order(&self.sm);
+        let then_align_cost = then_ctx.alignment_cost(&self.sm, &else_order);
+        let mut else_align_cost = else_ctx.alignment_cost(&self.sm, &then_order);
+        if else_align_cost > 0 && else_bindings.is_empty() {
+            else_align_cost += 1;
+        }
+        let inherited_order = if then_align_cost <= else_align_cost {
+            then_ctx.align_inherited_layout(&self.sm, &else_order);
+            else_order
+        } else {
+            else_ctx.align_inherited_layout(&self.sm, &then_order);
+            then_order
+        };
+
         // Trim each arm down to exactly its declared result slots.
         //
         // ANF lowering ends both arms with an identical N-binding block that
@@ -2675,6 +2849,23 @@ impl LoweringContext {
             );
         }
 
+        // Layer D: equal depth is not enough, the arms must agree slot by slot
+        // on every name the parent can read after OP_ENDIF. A slot only one arm
+        // names is skipped: a phase-3 placeholder, or the `if`'s own value,
+        // which each arm binds under its own temporary. Two different parent
+        // names at the same depth mean one path reads its neighbour's value
+        // (#178). Emits no opcodes.
+        for d in 0..then_ctx.sm.depth() {
+            let tn = then_ctx.sm.peek_at_depth(d);
+            let en = else_ctx.sm.peek_at_depth(d);
+            if !tn.is_empty() && !en.is_empty() && tn != en && pre_if_names.contains(tn) && pre_if_names.contains(en) {
+                panic!(
+                    "internal codegen error: conditional arms leave different stack layouts (depth {} holds {:?} after the then-arm and {:?} after the else-arm), so every later read of either slot would take the wrong value on one path (see GitHub issue #178); binding={:?}",
+                    d, tn, en, binding_name
+                );
+            }
+        }
+
         // NEW-018 needs the arms' post-branch name MULTISET. Snapshotted here
         // because the arms' op lists are consumed immediately after this point.
         let post_branch_counts = then_ctx.sm.name_counts();
@@ -2715,6 +2906,10 @@ impl LoweringContext {
                 excess -= 1;
             }
         }
+
+        // #178: what is left is exactly the slots both arms inherited, which
+        // now stand in `inherited_order` on either path. Model that order.
+        self.sm.relabel_named(&inherited_order, binding_name);
 
         // C27: the N>=2 result reconcile below also applies when the else-branch
         // is PRESENT and BOTH arms wrote the same N mutable fields (e.g. each

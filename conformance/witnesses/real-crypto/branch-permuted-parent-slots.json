@@ -1,0 +1,155 @@
+{
+  "fixture": "branch-permuted-parent-slots",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "Issue #178: a branch arm reordered the slots it inherited from the enclosing scope while keeping the same names at the same depth, so after the `if` the taken path read a neighbouring slot. `deadRebind` rebinds `w`, dead after the `if`, in place; `nestedRebind` rebinds the live `na` in a nested `if` without `else`; `siblingsAbove` does the same under three siblings, where the arms agree on a non-parent order (the else arm rolls `na` up) and the parent adopts it. Every accept pins expectedState: the miscompile committed a neighbour's value, so the pin fails on the VALUE. Constructor state is (a,b,c) = (5,7,9), all distinct, so a one-slot shift is visible in the continuation.",
+  "constructorArgs": [
+    "5n",
+    "7n",
+    "9n"
+  ],
+  "spends": [
+    {
+      "method": "deadRebind",
+      "args": [
+        "10n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "taken: w = 11 is rebound to 10 and never read; k = x+2 = 12 must reach the continuation",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "12n",
+        "b": "7n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "deadRebind",
+      "args": [
+        "10n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "not taken: k = 12",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "12n",
+        "b": "7n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "nestedRebind",
+      "args": [
+        "30n",
+        "1n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "both taken: na = x+1 = 31, nb keeps 7",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "31n",
+        "b": "7n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "nestedRebind",
+      "args": [
+        "30n",
+        "1n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "outer taken, inner not: na keeps 5, nb keeps 7",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "5n",
+        "b": "7n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "nestedRebind",
+      "args": [
+        "30n",
+        "0n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "outer not taken: na keeps 5, nb keeps 7",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "5n",
+        "b": "7n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "siblingsAbove",
+      "args": [
+        "10n",
+        "1n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "both taken: na = x = 10, then s1+s2 = 23, s3 = 13 — the else arm's roll must not move them",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "10n",
+        "b": "23n",
+        "c": "13n"
+      }
+    },
+    {
+      "method": "siblingsAbove",
+      "args": [
+        "10n",
+        "1n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "outer taken, inner not: na keeps 5",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "5n",
+        "b": "23n",
+        "c": "13n"
+      }
+    },
+    {
+      "method": "siblingsAbove",
+      "args": [
+        "10n",
+        "0n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "outer not taken: the else arm rolls na up and the parent reads the adopted order",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "5n",
+        "b": "23n",
+        "c": "13n"
+      }
+    },
+    {
+      "method": "nestedRebind",
+      "args": [
+        "30n",
+        "1n",
+        "1n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output — the rebound na must be committed to by hashOutputs",
+      "satoshis": 1000
+    }
+  ],
+  "goldenHashes": {
+    "expected-script.hex": "cd867f5e331e7e73c474949464e127537cfc81ab05ffb68b632f16e3ef9eede0"
+  }
+}

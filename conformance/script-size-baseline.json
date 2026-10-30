@@ -18,6 +18,7 @@
     "boolean-logic": 45,
     "bounded-loop": 42,
     "branch-merged-locals": 714,
+    "branch-permuted-parent-slots": 2214,
     "branched-readonly-len": 852,
     "byte-builtins": 5773,
     "cond-write-multi-field": 708,

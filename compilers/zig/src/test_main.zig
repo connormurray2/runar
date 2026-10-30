@@ -40,6 +40,7 @@ test {
     _ = @import("tests/repeated_operand_consume.zig");
     _ = @import("tests/branch_outputs_merged_locals.zig");
     _ = @import("tests/branch_merge_dead_arm_k1.zig");
+    _ = @import("tests/branch_arm_inherited_order.zig");
     _ = @import("tests/n051_branch_arm_private_helper.zig");
     _ = @import("tests/r072_method_scope_branch_arm.zig");
     _ = @import("tests/n079_inlined_param_alias_branch_arm.zig");

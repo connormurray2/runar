@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "./BranchPermutedParentSlots.runar.ts",
+    ".runar.sol": "./BranchPermutedParentSlots.runar.sol",
+    ".runar.move": "./BranchPermutedParentSlots.runar.move",
+    ".runar.go": "./BranchPermutedParentSlots.runar.go",
+    ".runar.rs": "./BranchPermutedParentSlots.runar.rs",
+    ".runar.py": "./BranchPermutedParentSlots.runar.py",
+    ".runar.zig": "./BranchPermutedParentSlots.runar.zig",
+    ".runar.rb": "./BranchPermutedParentSlots.runar.rb",
+    ".runar.java": "./BranchPermutedParentSlots.runar.java"
+  }
+}

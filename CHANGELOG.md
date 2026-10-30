@@ -79,6 +79,10 @@ the worked examples and which gate now catches which bug, and
 [`conformance/README.md`](conformance/README.md) for the provenance-discipline
 and weak-coverage-kind policies.
 
+### Fixed
+
+- **Silent miscompile (all tiers): a branch arm could reorder the slots it inherits from the enclosing scope** (#178). Two shapes did it while keeping the same names at the same depth: rebinding a local that is dead after the `if` (`w = w - 1n` consumed the old slot and pushed the new value on top), and a nested `if` without `else` rebinding a live local (the new value ended on top of its neighbours). The sibling arm kept the parent's order and the compiler kept modelling it, so after the `if` a read of a moved slot on the taken path got its neighbour's value: `let w = a; let k = b; if (a > 0n) { w = w - 1n; } assert(k === expected);` accepted `expected = a - 1`. Every tier emitted the same bytes in both fold modes, and `TestContract` agreed with the source. `lowerIf` now brings the arms' inherited slots into one order before the reconcile, rolling them in whichever arm costs fewer bytes, and the parent adopts that order after `OP_ENDIF`; a new Layer D check refuses, at compile time, any pair of arms that still disagree slot by slot. Bytes change only for affected contracts, typically one `OP_SWAP` or `ROLL` per permuted arm. No existing conformance golden moves; the `nested-if-multi-reassign/StackTrackerRepro` example gains one `OP_SWAP` (its tautological `assert(found || !found)` had been reading `p`). New fixture `branch-permuted-parent-slots` with a real-crypto witness; spend-level tests in `branch-arm-permuted-parent-slots-vm.test.ts`.
+
 ## [1.0.0-rc.1] — 2026-06-22
 
 First release candidate for 1.0.0. All seven compiler and SDK tiers are unified

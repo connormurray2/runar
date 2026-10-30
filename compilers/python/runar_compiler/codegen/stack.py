@@ -278,6 +278,19 @@ UNARYOP_OPCODES: dict[str, list[str]] = {
 # Stack map -- tracks named values on the stack
 # ---------------------------------------------------------------------------
 
+def _roll_sequence(depth: int, rolls: list[int]) -> list[int]:
+    """Replay ``rolls`` (arm indices, in turn) over a stack of ``depth`` slots
+    and return the depth each one rolls from."""
+    current = list(range(depth))
+    depths: list[int] = []
+    for index in rolls:
+        pos = current.index(index)
+        depths.append(len(current) - 1 - pos)
+        current.pop(pos)
+        current.append(index)
+    return depths
+
+
 class StackMap:
     """Tracks named values on the stack.
 
@@ -339,6 +352,23 @@ class StackMap:
         if not self.slots:
             raise RuntimeError("stack underflow on dup")
         self.slots.append(self.slots[-1])
+
+    def relabel_named(self, order: list[str], binding_name: str) -> None:
+        """Rename the named slots, bottom to top, to ``order``. The two must
+        hold the same names the same number of times: this changes which slot
+        a name models, never what is on the stack."""
+        named = [n for n in self.slots if n]
+        if sorted(named) != sorted(order):
+            raise RuntimeError(
+                "internal codegen error: the conditional's arms agree on slots "
+                f"{order!r} but the parent models {named!r}; "
+                f"binding={binding_name!r}"
+            )
+        k = 0
+        for i, n in enumerate(self.slots):
+            if n:
+                self.slots[i] = order[k]
+                k += 1
 
     def rename_at_depth(self, depth_from_top: int, new_name: Optional[str]) -> None:
         """Rename a slot at a given depth from top."""
@@ -1169,6 +1199,86 @@ class _LoweringContext:
                 self.sm.push(rolled)
                 self.emit_op(StackOp(op="drop"))
                 self.sm.pop()
+
+    def _inherited_slots(self, parent: StackMap) -> list[int]:
+        """The slots this arm inherited from the parent, as arm stack indices
+        (bottom = 0) in the arm's current order. A slot is matched to the parent
+        by name and multiplicity: for each name, the deepest
+        ``min(parent count, arm count)`` occurrences. Everything else the arm
+        holds (its results, a rebound local's new value) is not inherited.
+        """
+        parent_counts = parent.name_counts()
+        seen: dict[str, int] = {}
+        inherited: list[int] = []
+        for i, n in enumerate(self.sm.slots):
+            if not n:
+                continue
+            k = seen.get(n, 0)
+            seen[n] = k + 1
+            if k < parent_counts.get(n, 0):
+                inherited.append(i)
+        return inherited
+
+    def inherited_order(self, parent: StackMap) -> list[str]:
+        """The names of this arm's inherited slots, bottom first."""
+        return [self.sm.slots[i] for i in self._inherited_slots(parent)]
+
+    def _alignment_rolls(self, parent: StackMap, order: list[str]) -> list[int]:
+        """The arm slots to roll to the top, in turn, so that the inherited
+        slots stand in ``order`` (names, bottom first) with everything else
+        above them in its current order. The longest run at the bottom already
+        in place stays. Same-named slots keep their relative order, so a name
+        held twice keeps its dead-below-live layout.
+        """
+        inherited = self._inherited_slots(parent)
+        by_name: dict[str, list[int]] = {}
+        for i in inherited:
+            by_name.setdefault(self.sm.slots[i], []).append(i)
+        target: list[int] = []
+        taken: dict[str, int] = {}
+        for n in order:
+            k = taken.get(n, 0)
+            taken[n] = k + 1
+            target.append(by_name[n][k])
+        in_set = set(inherited)
+        target.extend(i for i in range(self.sm.depth()) if i not in in_set)
+        # Slots never rolled keep their relative order and sink to the bottom,
+        # so the longest increasing prefix of ``target`` stays and the rest is
+        # rolled.
+        keep = 0
+        while keep < len(target) and (keep == 0 or target[keep] > target[keep - 1]):
+            keep += 1
+        return target[keep:]
+
+    def alignment_cost(self, parent: StackMap, order: list[str]) -> int:
+        """Bytes ``align_inherited_layout`` would emit: SWAP and ROT are one
+        byte, a deeper ROLL is its depth push plus OP_ROLL."""
+        total = 0
+        for depth in _roll_sequence(self.sm.depth(), self._alignment_rolls(parent, order)):
+            if depth == 0:
+                continue
+            total += 1 if depth <= 2 else 2 if depth <= 16 else 3 if depth <= 127 else 4
+        return total
+
+    def align_inherited_layout(self, parent: StackMap, order: list[str]) -> None:
+        """Put this arm's inherited slots in ``order`` (issue #178): see
+        ``_alignment_rolls``. Emits nothing when they already are."""
+        rolls = self._alignment_rolls(parent, order)
+        for depth in _roll_sequence(self.sm.depth(), rolls):
+            if depth == 0:
+                continue
+            if depth == 1:
+                self.emit_op(StackOp(op="swap"))
+                self.sm.swap()
+            elif depth == 2:
+                self.emit_op(StackOp(op="rot"))
+                self.sm.push(self.sm.remove_at_depth(2))
+            else:
+                self.emit_op(StackOp(op="push", value=big_int_push(depth)))
+                self.sm.push("")
+                self.emit_op(StackOp(op="roll", depth=depth))
+                self.sm.pop()
+                self.sm.push(self.sm.remove_at_depth(depth))
 
     def _is_last_use(self, ref: str, current_index: int, last_uses: dict[str, int]) -> bool:
         last = last_uses.get(ref)
@@ -2151,6 +2261,33 @@ class _LoweringContext:
                     then_ctx.emit_op(StackOp(op="drop"))
                     then_ctx.sm.pop()
 
+        # Issue #178: both arms now hold the same inherited slots, but not
+        # necessarily in the same ORDER, and the order need not be the parent's.
+        # Rebinding a local that is dead after the ``if`` consumes its slot and
+        # pushes the new value on top (``w = w - 1n`` turns ``[w k]`` into
+        # ``[k w]``); a nested ``if`` without ``else`` that rebinds a live local
+        # leaves the new value on top of its neighbours. Everything below reads
+        # the arms by position, and used to model the parent's order, so a read
+        # of a moved slot on one path took its neighbour's value.
+        #
+        # Bring the arms into agreement here, in whichever arm costs fewer bytes
+        # (an else arm that would otherwise be empty also pays for its OP_ELSE),
+        # and let the parent adopt that order after OP_ENDIF. Before the result
+        # trim, which removes the slots just beneath the results and so needs
+        # every inherited slot below them.
+        then_order = then_ctx.inherited_order(self.sm)
+        else_order = else_ctx.inherited_order(self.sm)
+        then_align_cost = then_ctx.alignment_cost(self.sm, else_order)
+        else_align_cost = else_ctx.alignment_cost(self.sm, then_order)
+        if else_align_cost > 0 and not else_bindings:
+            else_align_cost += 1
+        if then_align_cost <= else_align_cost:
+            then_ctx.align_inherited_layout(self.sm, else_order)
+            inherited_order = else_order
+        else:
+            else_ctx.align_inherited_layout(self.sm, then_order)
+            inherited_order = then_order
+
         # Branch-merged locals: trim each arm down to exactly its K result slots.
         #
         # ANF lowering ends both arms with an identical K-binding block that
@@ -2254,6 +2391,24 @@ class _LoweringContext:
                 f"(see GitHub issue #99); binding={binding_name!r}"
             )
 
+        # Layer D: equal depth is not enough, the arms must agree slot by slot
+        # on every name the parent can read after OP_ENDIF. A slot only one arm
+        # names is skipped: a phase-3 placeholder, or the ``if``'s own value,
+        # which each arm binds under its own temporary. Two different parent
+        # names at the same depth mean one path reads its neighbour's value
+        # (#178). Emits no opcodes.
+        for d in range(then_ctx.sm.depth()):
+            tn = then_ctx.sm.peek_at_depth(d)
+            en = else_ctx.sm.peek_at_depth(d)
+            if tn and en and tn != en and tn in pre_if_names and en in pre_if_names:
+                raise RuntimeError(
+                    "internal codegen error: conditional arms leave different "
+                    f"stack layouts (depth {d} holds {tn!r} after the then-arm and "
+                    f"{en!r} after the else-arm), so every later read of either "
+                    "slot would take the wrong value on one path (see GitHub "
+                    f"issue #178); binding={binding_name!r}"
+                )
+
         # NEW-018 needs the arms' post-branch name MULTISET. Snapshotted here
         # because the arms' op lists are consumed immediately after this point.
         post_branch_counts = then_ctx.sm.name_counts()
@@ -2286,6 +2441,10 @@ class _LoweringContext:
             while excess > 0 and self.sm.has(name):
                 self.sm.remove_at_depth(self.sm.find_depth(name))
                 excess -= 1
+
+        # #178: what is left is exactly the slots both arms inherited, which now
+        # stand in ``inherited_order`` on either path. Model that order.
+        self.sm.relabel_named(inherited_order, binding_name)
 
         # C27: the N>=2 result reconcile below also applies when the else-branch
         # is PRESENT and BOTH arms wrote the same N mutable fields (e.g. each
