@@ -43,6 +43,9 @@ from runar_compiler.frontend.ast_nodes import (
 )
 from runar_compiler.frontend.diagnostic import Diagnostic, Severity
 
+# The shape of an ANF temporary name (t0, t1, ...); see validate_no_temp_names.
+_TEMP_NAME = re.compile(r"^t[0-9]+$")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -74,6 +77,7 @@ def validate(contract: ContractNode) -> ValidationResult:
     ctx.validate_properties()
     ctx.validate_constructor()
     ctx.validate_methods()
+    ctx.validate_no_temp_names()
     ctx.check_no_recursion()
 
     # Issue #123: reject preimage-field reads / output bindings that are unsound
@@ -1054,6 +1058,49 @@ class _ValidationContext:
     # -------------------------------------------------------------------
     # Recursion detection
     # -------------------------------------------------------------------
+
+    def validate_no_temp_names(self) -> None:
+        """Reject user identifiers that alias a compiler temporary.
+
+        ANF lowering names its temporaries t0, t1, ..., and user variables
+        keep their source names in the same binding namespace, so a user
+        variable called t1 shared a name with the temporary t1. Constant
+        folding then kept the temporary's value for the user variable and
+        folded a comparison against it, so the locking script diverged from
+        the source with no diagnostic. Mirrors validateNoTempNames in
+        02-validate.ts.
+        """
+
+        def reject(kind: str, name: str, loc: SourceLocation | None) -> None:
+            if _TEMP_NAME.match(name):
+                self._add_error(
+                    f"{kind} '{name}' uses a reserved name: identifiers of the form "
+                    "t<digits> are the compiler's temporaries. Rename it.",
+                    loc,
+                )
+
+        def visit(stmts: list[Statement]) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, VariableDeclStmt):
+                    reject("Local variable", stmt.name, stmt.source_location)
+                elif isinstance(stmt, IfStmt):
+                    visit(stmt.then)
+                    visit(stmt.else_ or [])
+                elif isinstance(stmt, ForStmt):
+                    if stmt.init is not None:
+                        reject("Loop variable", stmt.init.name, stmt.init.source_location)
+                    visit(stmt.body)
+
+        c = self.contract
+        for prop in c.properties:
+            reject("Property", prop.name, prop.source_location)
+        for param in c.constructor.params:
+            reject("Constructor parameter", param.name, c.constructor.source_location)
+        visit(c.constructor.body)
+        for method in c.methods:
+            for param in method.params:
+                reject("Parameter", param.name, method.source_location)
+            visit(method.body)
 
     def check_no_recursion(self) -> None:
         call_graph: dict[str, set[str]] = {}

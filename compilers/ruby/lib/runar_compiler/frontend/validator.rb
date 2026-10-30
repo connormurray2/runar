@@ -77,6 +77,7 @@ module RunarCompiler
       ctx.validate_properties
       ctx.validate_constructor
       ctx.validate_methods
+      ctx.validate_no_temp_names
       ctx.check_no_recursion
 
       # Issue #123: reject preimage-field reads / output bindings that are
@@ -389,6 +390,52 @@ module RunarCompiler
         end
 
         @contract.methods.each { |method| validate_method(method) }
+      end
+
+      # The shape of an ANF temporary name (t0, t1, ...).
+      TEMP_NAME = /\At[0-9]+\z/
+
+      # Reject user identifiers that alias a compiler temporary. ANF lowering
+      # names its temporaries t0, t1, ..., and user variables keep their source
+      # names in the same binding namespace, so a user variable called t1
+      # shared a name with the temporary t1. Constant folding then kept the
+      # temporary's value for the user variable and folded a comparison
+      # against it, so the locking script diverged from the source with no
+      # diagnostic. Mirrors validateNoTempNames in 02-validate.ts.
+      def validate_no_temp_names
+        reject = lambda do |kind, name, loc|
+          next unless TEMP_NAME.match?(name.to_s)
+
+          add_error(
+            "#{kind} '#{name}' uses a reserved name: identifiers of the form " \
+            "t<digits> are the compiler's temporaries. Rename it.",
+            loc: loc
+          )
+        end
+        visit = lambda do |stmts|
+          (stmts || []).each do |stmt|
+            case stmt
+            when VariableDeclStmt
+              reject.call("Local variable", stmt.name, stmt.source_location)
+            when IfStmt
+              visit.call(stmt.then)
+              visit.call(stmt.else_)
+            when ForStmt
+              reject.call("Loop variable", stmt.init.name, stmt.init.source_location) if stmt.init
+              visit.call(stmt.body)
+            end
+          end
+        end
+
+        @contract.properties.each { |p| reject.call("Property", p.name, p.source_location) }
+        @contract.constructor.params.each do |p|
+          reject.call("Constructor parameter", p.name, @contract.constructor.source_location)
+        end
+        visit.call(@contract.constructor.body)
+        @contract.methods.each do |m|
+          m.params.each { |p| reject.call("Parameter", p.name, m.source_location) }
+          visit.call(m.body)
+        end
       end
 
       # -------------------------------------------------------------------

@@ -43,6 +43,7 @@ export function validate(contract: ContractNode): ValidationResult {
   validateProperties(ctx);
   validateConstructor(ctx);
   validateMethods(ctx);
+  validateNoTempNames(ctx);
   checkNoRecursion(ctx);
 
   // Issue #123: reject preimage-field reads / output bindings that are unsound
@@ -489,6 +490,72 @@ function validateConstructorSlotBijection(ctx: ValidationContext): void {
       'error',
       loc,
     ));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reserved temporary names
+// ---------------------------------------------------------------------------
+
+/**
+ * ANF lowering names its temporaries `t0`, `t1`, … (`freshTemp` in
+ * 04-anf-lower), and user variables keep their source names in the same
+ * binding namespace. A user identifier of that shape therefore aliases a
+ * compiler temporary.
+ *
+ * That was a silent miscompile. In
+ *
+ *     assert(a >= 0n);            // lowers `0n` to temporary t1 = 0n
+ *     let t1: bigint = 0n;
+ *     if (a === 9n) { t1 = 10n; }
+ *     if (b === 5n && t1 === 0n) { t1 = 6n; }
+ *
+ * constant folding still held the temporary's `t1 = 0n` when it reached the
+ * second `t1 === 0n`, folded the comparison to `true`, and the script
+ * overwrote the 10 with 6. The interpreter computed 10, so every
+ * interpreter-level test stayed green while the locking script enforced a
+ * different contract. Whether a given name collides depends on how many
+ * temporaries precede it, so an unrelated edit could make the bug appear or
+ * vanish. The namespace is reserved outright instead.
+ */
+const TEMP_NAME = /^t[0-9]+$/;
+
+function validateNoTempNames(ctx: ValidationContext): void {
+  const reject = (kind: string, name: string, loc: SourceLocation | undefined): void => {
+    if (TEMP_NAME.test(name)) {
+      ctx.errors.push(makeDiagnostic(
+        `${kind} '${name}' uses a reserved name: identifiers of the form t<digits> are the compiler's temporaries. Rename it.`,
+        'error',
+        loc,
+      ));
+    }
+  };
+  const visit = (stmts: Statement[]): void => {
+    for (const stmt of stmts) {
+      switch (stmt.kind) {
+        case 'variable_decl':
+          reject('Local variable', stmt.name, stmt.sourceLocation);
+          break;
+        case 'if_statement':
+          visit(stmt.then);
+          if (stmt.else) visit(stmt.else);
+          break;
+        case 'for_statement':
+          reject('Loop variable', stmt.init.name, stmt.init.sourceLocation);
+          visit(stmt.body);
+          break;
+      }
+    }
+  };
+
+  for (const prop of ctx.contract.properties) reject('Property', prop.name, prop.sourceLocation);
+  for (const param of ctx.contract.constructor.params) {
+    reject('Constructor parameter', param.name, ctx.contract.constructor.sourceLocation);
+  }
+  visit(ctx.contract.constructor.body);
+  for (const method of ctx.contract.methods) {
+    for (const param of method.params) reject('Parameter', param.name, method.sourceLocation);
+    visit(method.body);
   }
 }
 

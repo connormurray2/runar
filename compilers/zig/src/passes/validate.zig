@@ -71,6 +71,7 @@ fn validateWithMode(
     try validateProperties(allocator, contract, &errors, &warnings);
     try validateConstructor(allocator, contract, mode, &errors);
     try validateMethods(allocator, contract, &errors, &warnings);
+    try validateNoTempNames(allocator, contract, &errors);
     try checkNoRecursion(allocator, contract, &errors);
 
     // Issue #123: reject preimage-field reads / output bindings that are
@@ -112,6 +113,79 @@ pub fn freeResult(allocator: Allocator, result: ValidationResult) void {
 // ============================================================================
 
 /// Property types that are valid in Runar contracts. Void is explicitly excluded.
+/// Whether `name` has the shape of an ANF temporary: `t` followed by one or
+/// more digits.
+fn isTempName(name: []const u8) bool {
+    if (name.len < 2 or name[0] != 't') return false;
+    for (name[1..]) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+fn rejectTempName(
+    allocator: Allocator,
+    kind: []const u8,
+    name: []const u8,
+    loc: ?SourceLocation,
+    errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
+) !void {
+    if (!isTempName(name)) return;
+    try errors.append(allocator, .{
+        .message = try std.fmt.allocPrint(
+            allocator,
+            "{s} '{s}' uses a reserved name: identifiers of the form t<digits> are the compiler's temporaries. Rename it.",
+            .{ kind, name },
+        ),
+        .location = loc,
+        .severity = .@"error",
+        .owned_message = true,
+    });
+}
+
+fn rejectTempNamesIn(
+    allocator: Allocator,
+    stmts: []const Statement,
+    errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
+) !void {
+    for (stmts) |stmt| {
+        switch (stmt) {
+            .const_decl => |d| try rejectTempName(allocator, "Local variable", d.name, d.source_loc, errors),
+            .let_decl => |d| try rejectTempName(allocator, "Local variable", d.name, d.source_loc, errors),
+            .if_stmt => |if_s| {
+                try rejectTempNamesIn(allocator, if_s.then_body, errors);
+                if (if_s.else_body) |eb| try rejectTempNamesIn(allocator, eb, errors);
+            },
+            .for_stmt => |f| {
+                try rejectTempName(allocator, "Loop variable", f.var_name, f.source_loc, errors);
+                try rejectTempNamesIn(allocator, f.body, errors);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Reject user identifiers that alias a compiler temporary. ANF lowering names
+/// its temporaries t0, t1, ..., and user variables keep their source names in
+/// the same binding namespace, so a user variable called t1 shared a name with
+/// the temporary t1. Constant folding then kept the temporary's value for the
+/// user variable and folded a comparison against it, so the locking script
+/// diverged from the source with no diagnostic. Mirrors validateNoTempNames in
+/// 02-validate.ts.
+fn validateNoTempNames(
+    allocator: Allocator,
+    contract: ContractNode,
+    errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
+) !void {
+    for (contract.properties) |prop| try rejectTempName(allocator, "Property", prop.name, prop.source_loc, errors);
+    for (contract.constructor.params) |param| try rejectTempName(allocator, "Constructor parameter", param.name, null, errors);
+    try rejectTempNamesIn(allocator, contract.constructor.body, errors);
+    for (contract.methods) |method| {
+        for (method.params) |param| try rejectTempName(allocator, "Parameter", param.name, method.source_loc, errors);
+        try rejectTempNamesIn(allocator, method.body, errors);
+    }
+}
+
 fn isValidPropertyType(t: RunarType) bool {
     return switch (t) {
         .bigint, .boolean, .byte_string, .pub_key, .sig, .sha256, .ripemd160,

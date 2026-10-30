@@ -49,6 +49,7 @@ func Validate(contract *ContractNode) *ValidationResult {
 	ctx.validateProperties()
 	ctx.validateConstructor()
 	ctx.validateMethods()
+	ctx.validateNoTempNames()
 	ctx.checkNoRecursion()
 
 	// Issue #123: reject preimage-field reads / output bindings that are
@@ -503,6 +504,69 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// isTempName reports whether name has the shape of an ANF temporary: `t`
+// followed by one or more digits.
+func isTempName(name string) bool {
+	if len(name) < 2 || name[0] != 't' {
+		return false
+	}
+	for _, c := range name[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validateNoTempNames rejects user identifiers that alias a compiler
+// temporary. ANF lowering names its temporaries t0, t1, ..., and user
+// variables keep their source names in the same binding namespace, so a user
+// variable called t1 shared a name with the temporary t1. Constant folding
+// then kept the temporary's value for the user variable and folded a
+// comparison against it, so the locking script diverged from the source
+// with no diagnostic. Mirrors validateNoTempNames in 02-validate.ts.
+func (ctx *validationContext) validateNoTempNames() {
+	reject := func(kind, name string, loc *SourceLocation) {
+		if isTempName(name) {
+			ctx.addErrorWithLoc(
+				fmt.Sprintf("%s '%s' uses a reserved name: identifiers of the form t<digits> are the compiler's temporaries — rename it", kind, name),
+				loc,
+			)
+		}
+	}
+	var visit func(stmts []Statement)
+	visit = func(stmts []Statement) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case VariableDeclStmt:
+				reject("local variable", s.Name, &s.SourceLocation)
+			case IfStmt:
+				visit(s.Then)
+				visit(s.Else)
+			case ForStmt:
+				reject("loop variable", s.Init.Name, &s.Init.SourceLocation)
+				visit(s.Body)
+			}
+		}
+	}
+
+	c := ctx.contract
+	for i := range c.Properties {
+		reject("property", c.Properties[i].Name, &c.Properties[i].SourceLocation)
+	}
+	for _, p := range c.Constructor.Params {
+		reject("constructor parameter", p.Name, &c.Constructor.SourceLocation)
+	}
+	visit(c.Constructor.Body)
+	for i := range c.Methods {
+		m := &c.Methods[i]
+		for _, p := range m.Params {
+			reject("parameter", p.Name, &m.SourceLocation)
+		}
+		visit(m.Body)
+	}
 }
 
 func isSuperCall(stmt Statement) bool {

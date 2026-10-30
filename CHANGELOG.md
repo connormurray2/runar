@@ -79,6 +79,10 @@ the worked examples and which gate now catches which bug, and
 [`conformance/README.md`](conformance/README.md) for the provenance-discipline
 and weak-coverage-kind policies.
 
+### Fixed
+
+- **BREAKING (all tiers): identifiers of the form `t<digits>` are reserved.** ANF lowering names its temporaries `t0`, `t1`, … in the same binding namespace as user variables, so a local, parameter, loop variable or property spelled like a temporary aliased one. With constant folding on (the default), the fold pass kept the temporary's constant for the user variable and folded comparisons against it. The locking script then diverged from the source while `TestContract` and the ANF interpreter agreed with the source. Every tier emitted the same wrong bytes. All seven validators now reject such names with a "uses a reserved name" diagnostic; rename the identifier. No conformance fixture, example or test contract used one. New negatives `N46-temp-name-local` and `N47-temp-name-param` gate the rule across every tier.
+
 ## [1.0.0-rc.1] — 2026-06-22
 
 First release candidate for 1.0.0. All seven compiler and SDK tiers are unified

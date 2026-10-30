@@ -102,6 +102,7 @@ public final class Validate {
         ctx.validateProperties();
         ctx.validateConstructor();
         ctx.validateMethods();
+        ctx.validateNoTempNames();
         ctx.checkNoRecursion();
         ctx.warnStrippedReadonlyFields();
 
@@ -1343,6 +1344,59 @@ public final class Validate {
         // --------------------------------------------------------------
         // Recursion detection
         // --------------------------------------------------------------
+
+        /** The shape of an ANF temporary name: {@code t} followed by one or more digits. */
+        private static final java.util.regex.Pattern TEMP_NAME = java.util.regex.Pattern.compile("t[0-9]+");
+
+        /**
+         * Reject user identifiers that alias a compiler temporary. ANF lowering
+         * names its temporaries t0, t1, ..., and user variables keep their
+         * source names in the same binding namespace, so a user variable called
+         * t1 shared a name with the temporary t1. Constant folding then kept the
+         * temporary's value for the user variable and folded a comparison
+         * against it, so the locking script diverged from the source with no
+         * diagnostic. Mirrors validateNoTempNames in 02-validate.ts.
+         */
+        void validateNoTempNames() {
+            for (PropertyNode p : contract.properties()) {
+                rejectTempName("Property", p.name(), p.sourceLocation());
+            }
+            MethodNode ctor = contract.constructor();
+            for (ParamNode p : ctor.params()) {
+                rejectTempName("Constructor parameter", p.name(), ctor.sourceLocation());
+            }
+            rejectTempNamesIn(ctor.body());
+            for (MethodNode m : contract.methods()) {
+                for (ParamNode p : m.params()) {
+                    rejectTempName("Parameter", p.name(), m.sourceLocation());
+                }
+                rejectTempNamesIn(m.body());
+            }
+        }
+
+        private void rejectTempNamesIn(List<Statement> stmts) {
+            if (stmts == null) return;
+            for (Statement stmt : stmts) {
+                if (stmt instanceof VariableDeclStatement d) {
+                    rejectTempName("Local variable", d.name(), d.sourceLocation());
+                } else if (stmt instanceof IfStatement i) {
+                    rejectTempNamesIn(i.thenBody());
+                    rejectTempNamesIn(i.elseBody());
+                } else if (stmt instanceof ForStatement f) {
+                    if (f.init() != null) {
+                        rejectTempName("Loop variable", f.init().name(), f.init().sourceLocation());
+                    }
+                    rejectTempNamesIn(f.body());
+                }
+            }
+        }
+
+        private void rejectTempName(String kind, String name, SourceLocation loc) {
+            if (name != null && TEMP_NAME.matcher(name).matches()) {
+                error(kind + " '" + name + "' uses a reserved name: identifiers of the form t<digits>"
+                    + " are the compiler's temporaries. Rename it.", loc);
+            }
+        }
 
         void checkNoRecursion() {
             Set<String> methodNames = new HashSet<>();

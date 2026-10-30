@@ -37,6 +37,7 @@ pub fn validate(contract: &ContractNode) -> ValidationResult {
     validate_properties(contract, &mut errors, &mut warnings);
     validate_constructor(contract, &mut errors);
     validate_methods(contract, &mut errors, &mut warnings);
+    validate_no_temp_names(contract, &mut errors);
     check_no_recursion(contract, &mut errors);
 
     // Issue #123: reject preimage-field reads / output bindings that are
@@ -472,6 +473,69 @@ fn validate_constructor_slot_bijection(contract: &ContractNode, errors: &mut Vec
             }
         }
         slot += 1;
+    }
+}
+
+/// Whether `name` has the shape of an ANF temporary: `t` followed by one or
+/// more digits.
+fn is_temp_name(name: &str) -> bool {
+    name.len() >= 2 && name.starts_with('t') && name[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Reject user identifiers that alias a compiler temporary. ANF lowering
+/// names its temporaries t0, t1, ..., and user variables keep their source
+/// names in the same binding namespace, so a user variable called t1 shared a
+/// name with the temporary t1. Constant folding then kept the temporary's
+/// value for the user variable and folded a comparison against it, so the
+/// locking script diverged from the source with no diagnostic. Mirrors
+/// validateNoTempNames in 02-validate.ts.
+fn validate_no_temp_names(contract: &ContractNode, errors: &mut Vec<Diagnostic>) {
+    fn reject(kind: &str, name: &str, loc: &SourceLocation, errors: &mut Vec<Diagnostic>) {
+        if is_temp_name(name) {
+            errors.push(Diagnostic::error(
+                format!(
+                    "{} '{}' uses a reserved name: identifiers of the form t<digits> are the compiler's temporaries. Rename it.",
+                    kind, name
+                ),
+                Some(loc.clone()),
+            ));
+        }
+    }
+    fn visit(stmts: &[Statement], errors: &mut Vec<Diagnostic>) {
+        for stmt in stmts {
+            match stmt {
+                Statement::VariableDecl { name, source_location, .. } => {
+                    reject("Local variable", name, source_location, errors);
+                }
+                Statement::IfStatement { then_branch, else_branch, .. } => {
+                    visit(then_branch, errors);
+                    if let Some(else_branch) = else_branch {
+                        visit(else_branch, errors);
+                    }
+                }
+                Statement::ForStatement { init, body, .. } => {
+                    if let Statement::VariableDecl { name, source_location, .. } = init.as_ref() {
+                        reject("Loop variable", name, source_location, errors);
+                    }
+                    visit(body, errors);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for prop in &contract.properties {
+        reject("Property", &prop.name, &prop.source_location, errors);
+    }
+    for param in &contract.constructor.params {
+        reject("Constructor parameter", &param.name, &contract.constructor.source_location, errors);
+    }
+    visit(&contract.constructor.body, errors);
+    for method in &contract.methods {
+        for param in &method.params {
+            reject("Parameter", &param.name, &method.source_location, errors);
+        }
+        visit(&method.body, errors);
     }
 }
 
